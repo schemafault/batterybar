@@ -51,6 +51,10 @@ Right-click any icon for a menu with:
 
 If no device is found, a single placeholder icon stays so that the menu is still reachable. Only one instance runs at a time.
 
+## Releases
+
+Every push is built on GitHub Actions and the executable is attached to the run as the BatteryBar artefact. Pushing a tag that starts with "v" (for example v1.0.0) also publishes the executable as a GitHub release.
+
 ## Limits
 
 - The HID++ code has not been checked against every Logitech model. Devices that answer only HID++ 1.0 are not supported.
