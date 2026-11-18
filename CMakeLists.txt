@@ -19,12 +19,17 @@ endif()
 # Platform-independent protocol tests: build everywhere.
 enable_testing()
 add_executable(hidpp_tests tests/hidpp_tests.cpp src/hidpp_proto.cpp)
-if(MINGW)
-  target_link_options(hidpp_tests PRIVATE -static)
-endif()
-if(NOT CMAKE_CROSSCOMPILING)
-  add_test(NAME hidpp_tests COMMAND hidpp_tests)
-endif()
+add_executable(roster_tests tests/roster_tests.cpp src/roster.cpp)
+add_executable(appearance_tests tests/appearance_tests.cpp src/appearance.cpp)
+foreach(t hidpp_tests roster_tests appearance_tests)
+  target_include_directories(${t} PRIVATE src)
+  if(MINGW)
+    target_link_options(${t} PRIVATE -static)
+  endif()
+  if(NOT CMAKE_CROSSCOMPILING)
+    add_test(NAME ${t} COMMAND ${t})
+  endif()
+endforeach()
 
 # The tray utility needs Windows (native or a MinGW cross toolchain).
 if(WIN32)
@@ -32,13 +37,15 @@ if(WIN32)
 
   add_executable(BatteryBar WIN32
     src/main.cpp
+    src/roster.cpp
+    src/appearance.cpp
     src/hidpp_proto.cpp
     src/hidpp.cpp
     src/btbattery.cpp
     src/xinput_battery.cpp
     res/app.rc)
   target_compile_definitions(BatteryBar PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
-  target_link_libraries(BatteryBar PRIVATE setupapi hid cfgmgr32 shell32 user32 gdi32 advapi32)
+  target_link_libraries(BatteryBar PRIVATE setupapi hid cfgmgr32 shell32 user32 gdi32 advapi32 ole32 uuid)
 
   if(MSVC)
     # CMake merges the manifest itself; keep it out of the .rc to avoid a duplicate resource.

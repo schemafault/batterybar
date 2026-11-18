@@ -71,15 +71,54 @@ bool parseBatteryVoltage(const std::vector<uint8_t>& p, Battery& out) {
     return true;
 }
 
-Kind kindFromType(int t) {
+DeviceKind kindFromType(int t) {
     switch (t) {
-        case 0: return Kind::Keyboard;
-        case 3: case 4: case 5: return Kind::Mouse;  // mouse, trackpad, trackball
-        case 8: return Kind::Headset;
-        case 11: case 12: case 17: return Kind::Controller;  // joystick, gamepad, programmable
-        default: return Kind::Other;
+        case 0: return DeviceKind::Keyboard;
+        case 3: case 4: case 5: return DeviceKind::Mouse;  // mouse, trackpad, trackball
+        case 8: return DeviceKind::Headset;
+        case 11: case 12: case 17: return DeviceKind::Controller;  // joystick, gamepad, programmable
+        default: return DeviceKind::Other;
     }
 }
+
+namespace {
+
+constexpr uint16_t kFeatDeviceName = 0x0005;
+constexpr uint16_t kFeatBatteryStatus = 0x1000;
+constexpr uint16_t kFeatBatteryVoltage = 0x1001;
+constexpr uint16_t kFeatUnifiedBattery = 0x1004;
+
+struct Reply {
+    bool ok = false;
+    bool timedOut = false;
+    uint8_t error = 0;              // error code when an error reply arrived
+    std::vector<uint8_t> params;    // bytes after the 4-byte header
+};
+
+class Session {
+public:
+    Session(Transport t, int timeoutMs) : t_(std::move(t)), timeoutMs_(timeoutMs) {}
+
+    // Sends one request and waits for the matching reply, skipping unrelated
+    // notifications. params longer than 3 bytes force a long report.
+    Reply call(uint8_t devIdx, uint8_t featIdx, uint8_t function,
+               const std::vector<uint8_t>& params = {});
+
+    // Returns the feature index, 0 if unsupported, -1 on timeout or error.
+    int featureIndex(uint8_t devIdx, uint16_t featureId);
+    bool readBattery(uint8_t devIdx, Battery& out);
+    bool readName(uint8_t devIdx, std::string& out);
+    int readType(uint8_t devIdx);  // -1 if unknown
+    // Pings first (with retries for slow wake-ups). Battery is mandatory;
+    // name and type are best effort.
+    bool probe(uint8_t devIdx, FoundDevice& out);
+
+private:
+    uint8_t nextSwId();
+    Transport t_;
+    int timeoutMs_;
+    uint8_t swId_ = 0x09;
+};
 
 uint8_t Session::nextSwId() {
     swId_ = (swId_ >= 0x0F) ? 0x01 : static_cast<uint8_t>(swId_ + 1);
@@ -187,12 +226,39 @@ int Session::readType(uint8_t devIdx) {
     return r.params[0];
 }
 
-bool Session::probe(uint8_t devIdx, DeviceInfo& out) {
+bool Session::probe(uint8_t devIdx, FoundDevice& out) {
+    // An idle device can take over a second to answer its first request, so
+    // retry the initial ping. An error reply means nothing is there: give up
+    // at once. Late replies to earlier pings are skipped by their software id.
+    bool alive = false;
+    for (int attempt = 0; attempt < 3 && !alive; ++attempt) {
+        Reply ping = call(devIdx, 0x00, 0, {0x00, 0x01});
+        if (ping.ok) alive = true;
+        else if (!ping.timedOut) return false;
+    }
+    if (!alive) return false;
+    out.index = devIdx;
     if (!readBattery(devIdx, out.battery)) return false;
     readName(devIdx, out.name);
     int type = readType(devIdx);
-    out.kind = type >= 0 ? kindFromType(type) : Kind::Other;
+    out.kind = type >= 0 ? kindFromType(type) : DeviceKind::Other;
     return true;
+}
+
+}  // namespace
+
+std::vector<FoundDevice> discover(Transport t, int timeoutMs) {
+    Session session(std::move(t), timeoutMs);
+    std::vector<FoundDevice> found;
+
+    FoundDevice direct;
+    if (session.probe(kDirectIndex, direct)) return {direct};  // direct Bluetooth or USB device
+
+    for (uint8_t idx = 1; idx <= 6; ++idx) {  // receiver slots
+        FoundDevice d;
+        if (session.probe(idx, d)) found.push_back(d);
+    }
+    return found;
 }
 
 }  // namespace hidpp

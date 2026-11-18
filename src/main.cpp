@@ -1,55 +1,53 @@
-// BatteryBar: one notification-area icon per wireless device, showing its
-// battery percentage. Polling runs on a worker thread; the UI thread only
-// draws icons and handles messages.
+// BatteryBar: one taskbar button per wireless device, showing a picture of the
+// device and its battery percentage. Polling runs on a worker thread; the UI
+// thread only draws icons and handles messages.
+#include "appearance.h"
 #include "device.h"
+#include "roster.h"
 
 #include <windows.h>
-#include <windowsx.h>
 #include <dbt.h>
+#include <objbase.h>
+#include <propsys.h>
 #include <shellapi.h>
+#include <shobjidl.h>
 
 #include <algorithm>
 #include <cstdint>
-#include <cwctype>
 #include <map>
 #include <memory>
 #include <utility>
 
-#ifndef NIF_SHOWTIP
-#define NIF_SHOWTIP 0x00000080
-#endif
-#ifndef NOTIFYICON_VERSION_4
-#define NOTIFYICON_VERSION_4 4
-#endif
-
 namespace {
 
-constexpr UINT WM_TRAY = WM_APP + 1;    // tray callback (NOTIFYICON_VERSION_4 semantics)
-constexpr UINT WM_RESULT = WM_APP + 2;  // lParam: heap-allocated std::vector<BatteryInfo>*
+constexpr UINT WM_SHOWMENU = WM_APP + 1;  // a taskbar button was clicked
+constexpr UINT WM_RESULT = WM_APP + 2;    // lParam: heap-allocated ProviderReadings*
 constexpr UINT_PTR TIMER_POLL = 1;
 constexpr UINT_PTR TIMER_DEBOUNCE = 2;
 constexpr UINT POLL_MS = 60000;
 constexpr UINT DEBOUNCE_MS = 2000;
-constexpr ULONGLONG STALE_KEEP_MS = 30 * 60 * 1000;  // how long a silent device keeps its icon
 enum MenuId { ID_REFRESH = 100, ID_AUTOSTART, ID_EXIT };
 
 const wchar_t kClassName[] = L"BatteryBarWindow";
+const wchar_t kButtonClass[] = L"BatteryBarButton";
 const wchar_t kRunKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 const wchar_t kRunValue[] = L"BatteryBar";
 const wchar_t kNoDevicesId[] = L"none";
 
-struct Tray {
-    UINT uid = 0;
-    HICON icon = nullptr;
-    bool added = false;
+// PKEY_AppUserModel_ID, spelled out so no extra import library is needed.
+const PROPERTYKEY kAppUserModelIdKey = {{0x9F4C2855, 0x9F79, 0x4B39, {0xA8, 0xD0, 0xE1, 0xD4, 0x2D, 0xE1, 0xD5, 0xF3}}, 5};
+
+struct Button {
+    HWND hwnd = nullptr;
+    HICON bigIcon = nullptr, smallIcon = nullptr;
+    std::wstring state;  // what the button currently shows, to skip needless updates
 };
 
 struct App {
     HWND hwnd = nullptr;
-    UINT taskbarCreated = 0;
+    Roster roster;                           // UI thread only
     std::vector<BatteryInfo> devices;
-    std::map<std::wstring, Tray> trays;  // keyed by BatteryInfo::id
-    UINT nextUid = 1;
+    std::map<std::wstring, Button> buttons;  // keyed by BatteryInfo::id
     HANDLE wake = nullptr;    // auto-reset event: "poll now"
     HANDLE worker = nullptr;
     volatile LONG quit = 0;
@@ -57,80 +55,25 @@ struct App {
 
 // ---- Polling ---------------------------------------------------------------
 
-std::wstring LowerCopy(std::wstring s) {
-    for (auto& c : s) c = static_cast<wchar_t>(std::towlower(c));
-    return s;
-}
-
-bool NamesOverlap(const std::wstring& a, const std::wstring& b) {
-    std::wstring x = LowerCopy(a), y = LowerCopy(b);
-    if (x.size() < 3 || y.size() < 3) return false;
-    return x.find(y) != std::wstring::npos || y.find(x) != std::wstring::npos;
-}
-
-// Runs all providers and merges the results, preferring HID++ over Bluetooth
-// over XInput when the same device shows up more than once.
-std::vector<BatteryInfo> Collect() {
-    std::vector<BatteryInfo> all;
+// Asks every provider for its readings. Which of them end up on the taskbar
+// is the roster's decision, made on the UI thread.
+ProviderReadings Collect() {
+    ProviderReadings r;
     try {
-        all = QueryHidpp();
-        const size_t hidCount = all.size();
-        bool btController = false;
-        for (BatteryInfo& b : QueryBluetooth()) {
-            bool dup = false;
-            for (size_t i = 0; i < hidCount; ++i) dup = dup || NamesOverlap(all[i].name, b.name);
-            if (dup) continue;
-            btController = btController || b.kind == DeviceKind::Controller;
-            all.push_back(b);
-        }
-        // XInput slots cannot be matched to Bluetooth devices, so skip them if
-        // a Bluetooth controller was already reported.
-        if (!btController)
-            for (BatteryInfo& x : QueryXInput()) all.push_back(x);
+        r.hidpp = QueryHidpp();
+        r.bluetooth = QueryBluetooth();
+        r.xinput = QueryXInput();
     } catch (...) {
         // A provider failed unexpectedly: show whatever we have.
     }
-    std::stable_sort(all.begin(), all.end(), [](const BatteryInfo& a, const BatteryInfo& b) {
-        return a.kind != b.kind ? a.kind < b.kind : a.name < b.name;
-    });
-    return all;
-}
-
-// A sleeping Logitech device stops answering until it is next used. Keep its
-// last reading for a while, marked as stale, so the icon does not flicker.
-std::vector<BatteryInfo> Retain(std::vector<BatteryInfo> fresh) {
-    static std::map<std::wstring, std::pair<BatteryInfo, ULONGLONG>> seen;
-    const ULONGLONG now = GetTickCount64();
-    for (const BatteryInfo& b : fresh)
-        if (b.id.compare(0, 6, L"hidpp:") == 0) seen[b.id] = {b, now};
-    for (auto it = seen.begin(); it != seen.end();) {
-        if (now - it->second.second > STALE_KEEP_MS) {
-            it = seen.erase(it);
-            continue;
-        }
-        const BatteryInfo& old = it->second.first;
-        bool present = std::any_of(fresh.begin(), fresh.end(), [&](const BatteryInfo& b) {
-            return b.id == old.id || (b.kind == old.kind && NamesOverlap(b.name, old.name));
-        });
-        if (!present) {
-            BatteryInfo b = old;
-            b.stale = true;
-            b.charging = false;
-            fresh.push_back(b);
-        }
-        ++it;
-    }
-    std::stable_sort(fresh.begin(), fresh.end(), [](const BatteryInfo& a, const BatteryInfo& b) {
-        return a.kind != b.kind ? a.kind < b.kind : a.name < b.name;
-    });
-    return fresh;
+    return r;
 }
 
 DWORD WINAPI WorkerMain(LPVOID) {
     for (;;) {
         WaitForSingleObject(g.wake, INFINITE);
         if (g.quit) break;
-        auto* result = new std::vector<BatteryInfo>(Collect());
+        auto* result = new ProviderReadings(Collect());
         if (g.quit || !PostMessageW(g.hwnd, WM_RESULT, 0, reinterpret_cast<LPARAM>(result))) delete result;
     }
     return 0;
@@ -140,46 +83,12 @@ void RequestPoll() { SetEvent(g.wake); }
 
 // ---- Icon drawing ----------------------------------------------------------
 
-COLORREF LevelColour(int percent) {
-    if (percent < 0) return RGB(170, 170, 170);
-    if (percent > 50) return RGB(80, 220, 100);
-    if (percent > 20) return RGB(255, 193, 7);
-    return RGB(255, 82, 82);
-}
-
-uint32_t KindBand(DeviceKind k) {  // 0xRRGGBB
-    switch (k) {
-        case DeviceKind::Mouse: return 0x4FC3F7;       // blue: M
-        case DeviceKind::Keyboard: return 0xB388FF;    // violet: K
-        case DeviceKind::Headset: return 0xF06292;     // pink: H
-        case DeviceKind::Controller: return 0xFFFFFF;  // white: C
-        default: return 0x909090;
-    }
-}
-
-wchar_t KindLetter(DeviceKind k) {
-    switch (k) {
-        case DeviceKind::Mouse: return L'M';
-        case DeviceKind::Keyboard: return L'K';
-        case DeviceKind::Headset: return L'H';
-        case DeviceKind::Controller: return L'C';
-        default: return L'?';
-    }
-}
-
-// Rounded-square mask; r is the corner radius in pixels.
-bool InsideShape(int x, int y, int s, int r) {
-    int dx = x < r ? r - 1 - x : (x >= s - r ? x - (s - r) : -1);
-    int dy = y < r ? r - 1 - y : (y >= s - r ? y - (s - r) : -1);
-    return dx < 0 || dy < 0 || dx * dx + dy * dy < r * r;
-}
-
-// Draws a dark rounded square with the percentage in a level colour, a band
-// along the bottom for the device kind, and a white top band while charging.
-HICON MakeIcon(const BatteryInfo& b) {
-    int s = std::max(16, GetSystemMetrics(SM_CXSMICON));
-    int band = std::max(2, s / 8);
-    int radius = std::max(2, s / 6);
+// Turns the appearance module's description into an icon. What the icon shows
+// is decided there; this only adds the number, which needs GDI text.
+HICON MakeIcon(const BatteryInfo& b, int s) {
+    const ButtonAppearance look = Describe(b);
+    const std::vector<uint32_t> backdrop = RenderBackdrop(b, s);
+    if (s <= 0 || backdrop.size() != static_cast<size_t>(s) * static_cast<size_t>(s)) return nullptr;
 
     BITMAPINFO bi = {};
     bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
@@ -199,46 +108,34 @@ HICON MakeIcon(const BatteryInfo& b) {
     }
     HGDIOBJ oldBmp = SelectObject(dc, color);
     auto* px = static_cast<uint32_t*>(bits);
+    for (size_t i = 0; i < backdrop.size(); ++i) px[i] = backdrop[i] & 0x00FFFFFFu;
 
-    for (int y = 0; y < s; ++y) {
-        for (int x = 0; x < s; ++x) {
-            uint32_t c = 0;
-            if (InsideShape(x, y, s, radius)) {
-                c = 0xFF202020;
-                if (y >= s - band) c = 0xFF000000 | KindBand(b.kind);
-                else if (b.charging && y < band) c = 0xFFFFFFFF;
-            }
-            px[y * s + x] = c;
-        }
-    }
-
-    std::wstring text = b.percent < 0 ? L"?" : std::to_wstring(std::min(b.percent, 100));
+    const TextBand band = TextBandFor(s);
     SetBkMode(dc, TRANSPARENT);
-    SetTextColor(dc, LevelColour(b.percent));
+    SetTextColor(dc, RGB((look.textColour >> 16) & 0xFF, (look.textColour >> 8) & 0xFF, look.textColour & 0xFF));
     HFONT font = nullptr;
     HGDIOBJ oldFont = nullptr;
-    for (int h = s - 2 * band; h >= 6; --h) {  // shrink until the text fits
+    for (int h = band.bottom - band.top; h >= 6; --h) {  // shrink until the text fits
         HFONT f = CreateFontW(-h, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
                               CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
         if (!f) break;
         HGDIOBJ prev = SelectObject(dc, f);
         SIZE sz = {};
-        GetTextExtentPoint32W(dc, text.c_str(), static_cast<int>(text.size()), &sz);
+        GetTextExtentPoint32W(dc, look.text.c_str(), static_cast<int>(look.text.size()), &sz);
         if (font) DeleteObject(font);
         font = f;
         if (!oldFont) oldFont = prev;
-        if (sz.cx <= s - 2) break;
+        if (sz.cx <= s - std::max(2, s / 10)) break;
     }
-    RECT rc = {0, band, s, s - band};
-    DrawTextW(dc, text.c_str(), -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    RECT rc = {0, band.top, s, band.bottom};
+    DrawTextW(dc, look.text.c_str(), -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
     GdiFlush();
 
-    // GDI text leaves the alpha byte undefined: set it from the shape mask.
-    for (int y = 0; y < s; ++y)
-        for (int x = 0; x < s; ++x) {
-            uint32_t& p = px[y * s + x];
-            p = InsideShape(x, y, s, radius) ? (p | 0xFF000000u) : 0u;
-        }
+    // GDI text leaves the alpha byte undefined: take it from the backdrop.
+    for (size_t i = 0; i < backdrop.size(); ++i) {
+        uint32_t alpha = backdrop[i] & 0xFF000000u;
+        px[i] = alpha ? ((px[i] & 0x00FFFFFFu) | alpha) : 0u;
+    }
 
     std::vector<BYTE> zeros(static_cast<size_t>((s + 15) / 16) * 2 * static_cast<size_t>(s), 0);
     HBITMAP mask = CreateBitmap(s, s, 1, 1, zeros.data());
@@ -257,55 +154,37 @@ HICON MakeIcon(const BatteryInfo& b) {
     return icon;
 }
 
-// ---- Tray ------------------------------------------------------------------
+// ---- Taskbar buttons -------------------------------------------------------
 
-std::wstring Tooltip(const BatteryInfo& b) {
-    if (b.percent < 0) return b.name;
-    std::wstring t = b.name + L": " + (b.approximate ? L"~" : L"") + std::to_wstring(b.percent) + L"%";
-    if (b.charging) t += L" (charging)";
-    if (b.stale) t += L" (asleep, last reading)";
-    return t;
+// The taskbar groups windows by application id. Give each device its own, so
+// every device gets a separate button and keeps its place on the taskbar.
+void SetAppId(HWND hwnd, const std::wstring& deviceId) {
+    uint32_t h = 2166136261u;  // FNV-1a
+    for (wchar_t c : deviceId) h = (h ^ static_cast<uint32_t>(c)) * 16777619u;
+    wchar_t appId[64];
+    wsprintfW(appId, L"BatteryBar.Device.%08X", h);
+
+    IPropertyStore* store = nullptr;
+    if (FAILED(SHGetPropertyStoreForWindow(hwnd, IID_IPropertyStore, reinterpret_cast<void**>(&store))) || !store) return;
+    PROPVARIANT value;
+    PropVariantInit(&value);
+    value.vt = VT_LPWSTR;
+    value.pwszVal = appId;  // borrowed: not cleared
+    store->SetValue(kAppUserModelIdKey, value);
+    store->Release();
 }
 
-NOTIFYICONDATAW BaseNid(const Tray& t) {
-    NOTIFYICONDATAW nid = {};
-    nid.cbSize = sizeof(nid);
-    nid.hWnd = g.hwnd;
-    nid.uID = t.uid;
-    return nid;
+void DestroyButton(Button& b) {
+    if (b.hwnd) DestroyWindow(b.hwnd);
+    if (b.bigIcon) DestroyIcon(b.bigIcon);
+    if (b.smallIcon) DestroyIcon(b.smallIcon);
+    b = Button();
 }
 
-void ShowIcon(Tray& t, const BatteryInfo& b) {
-    NOTIFYICONDATAW nid = BaseNid(t);
-    nid.uFlags = NIF_ICON | NIF_TIP | NIF_SHOWTIP;
-    nid.hIcon = t.icon;
-    lstrcpynW(nid.szTip, Tooltip(b).c_str(), ARRAYSIZE(nid.szTip));
-    if (t.added) {
-        Shell_NotifyIconW(NIM_MODIFY, &nid);
-        return;
-    }
-    nid.uFlags |= NIF_MESSAGE;
-    nid.uCallbackMessage = WM_TRAY;
-    if (Shell_NotifyIconW(NIM_ADD, &nid)) {
-        nid.uVersion = NOTIFYICON_VERSION_4;
-        Shell_NotifyIconW(NIM_SETVERSION, &nid);
-        t.added = true;
-    }
-}
-
-void RemoveIcon(Tray& t) {
-    if (t.added) {
-        NOTIFYICONDATAW nid = BaseNid(t);
-        Shell_NotifyIconW(NIM_DELETE, &nid);
-        t.added = false;
-    }
-    if (t.icon) DestroyIcon(t.icon);
-    t.icon = nullptr;
-}
-
-// Reconciles tray icons with the device list: add, update, remove.
-void ApplyDevices(std::vector<BatteryInfo> list) {
-    if (list.empty()) {  // keep one icon so the menu (and Exit) stays reachable
+// Reconciles taskbar buttons with the device list: add, update, remove.
+// Each button is a window that stays minimised; its icon and title carry the reading.
+void ApplyDevices(std::vector<BatteryInfo> list, bool redraw = false) {
+    if (list.empty()) {  // keep one button so the menu (and Exit) stays reachable
         BatteryInfo none;
         none.name = L"No devices found";
         none.id = kNoDevicesId;
@@ -314,27 +193,39 @@ void ApplyDevices(std::vector<BatteryInfo> list) {
     g.devices = list;
 
     for (const BatteryInfo& b : g.devices) {
-        auto it = g.trays.find(b.id);
-        if (it == g.trays.end()) {
-            Tray t;
-            t.uid = g.nextUid++;
-            it = g.trays.emplace(b.id, t).first;
+        Button& btn = g.buttons[b.id];
+        std::wstring label = Describe(b).label;
+        std::wstring state = label + L"|" + std::to_wstring(static_cast<int>(b.kind));
+        if (!btn.hwnd) {
+            btn.hwnd = CreateWindowExW(WS_EX_APPWINDOW, kButtonClass, label.c_str(),
+                                       WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, CW_USEDEFAULT,
+                                       CW_USEDEFAULT, 300, 120, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+            if (!btn.hwnd) continue;
+            SetAppId(btn.hwnd, b.id);
+        } else if (state == btn.state && !redraw) {
+            continue;  // nothing changed: leave the button alone
         }
-        Tray& t = it->second;
-        HICON fresh = MakeIcon(b);
-        if (!fresh) continue;
-        HICON old = t.icon;
-        t.icon = fresh;
-        ShowIcon(t, b);
-        if (old) DestroyIcon(old);  // only after the shell has the new one
+        btn.state = state;
+        SetWindowTextW(btn.hwnd, label.c_str());
+
+        // The taskbar scales the large icon down, so draw it with pixels to spare.
+        HICON bigIcon = MakeIcon(b, 2 * GetSystemMetrics(SM_CXICON));
+        HICON smallIcon = MakeIcon(b, GetSystemMetrics(SM_CXSMICON));
+        if (bigIcon) SendMessageW(btn.hwnd, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(bigIcon));
+        if (smallIcon) SendMessageW(btn.hwnd, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(smallIcon));
+        if (bigIcon && btn.bigIcon) DestroyIcon(btn.bigIcon);  // only after the window has the new one
+        if (smallIcon && btn.smallIcon) DestroyIcon(btn.smallIcon);
+        if (bigIcon) btn.bigIcon = bigIcon;
+        if (smallIcon) btn.smallIcon = smallIcon;
+        if (!IsWindowVisible(btn.hwnd)) ShowWindow(btn.hwnd, SW_SHOWMINNOACTIVE);
     }
-    for (auto it = g.trays.begin(); it != g.trays.end();) {
+    for (auto it = g.buttons.begin(); it != g.buttons.end();) {
         bool live = std::any_of(g.devices.begin(), g.devices.end(), [&](const BatteryInfo& b) { return b.id == it->first; });
         if (live) {
             ++it;
         } else {
-            RemoveIcon(it->second);
-            it = g.trays.erase(it);
+            DestroyButton(it->second);
+            it = g.buttons.erase(it);
         }
     }
 }
@@ -369,7 +260,7 @@ void ShowMenu(int x, int y) {
     HMENU menu = CreatePopupMenu();
     if (!menu) return;
     for (const BatteryInfo& b : g.devices) {
-        std::wstring line = b.id == kNoDevicesId ? b.name : Tooltip(b);
+        std::wstring line = b.id == kNoDevicesId ? b.name : Describe(b).label;
         std::wstring label = b.percent >= 0 ? std::wstring(1, KindLetter(b.kind)) + L"  " + line : line;
         AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, label.c_str());
     }
@@ -388,22 +279,36 @@ void ShowMenu(int x, int y) {
     else if (cmd == ID_EXIT) DestroyWindow(g.hwnd);
 }
 
-// ---- Window ----------------------------------------------------------------
+// ---- Windows ---------------------------------------------------------------
+
+// A device's taskbar button. The window never opens: clicking the button asks
+// to restore it, which shows the menu instead.
+LRESULT CALLBACK ButtonProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+        case WM_QUERYOPEN:
+            PostMessageW(g.hwnd, WM_SHOWMENU, 0, 0);
+            return FALSE;  // stay minimised
+        case WM_CLOSE:  // "Close window" on the taskbar button exits the app
+            PostMessageW(g.hwnd, WM_CLOSE, 0, 0);
+            return 0;
+        default:
+            return DefWindowProcW(hwnd, msg, wp, lp);
+    }
+}
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
-    if (msg == g.taskbarCreated && msg != 0) {  // Explorer restarted: icons are gone
-        for (auto& kv : g.trays) kv.second.added = false;
-        ApplyDevices(g.devices);
-        return 0;
-    }
     switch (msg) {
-        case WM_TRAY:
-            // Version 4 sends WM_CONTEXTMENU after the right-button messages; handle only that one.
-            if (LOWORD(lp) == WM_CONTEXTMENU) ShowMenu(GET_X_LPARAM(wp), GET_Y_LPARAM(wp));
+        case WM_SHOWMENU: {
+            MSG extra;  // one click can ask more than once: show a single menu
+            while (PeekMessageW(&extra, hwnd, WM_SHOWMENU, WM_SHOWMENU, PM_REMOVE)) {}
+            POINT pt = {};
+            GetCursorPos(&pt);
+            ShowMenu(pt.x, pt.y);
             return 0;
+        }
         case WM_RESULT: {
-            std::unique_ptr<std::vector<BatteryInfo>> result(reinterpret_cast<std::vector<BatteryInfo>*>(lp));
-            ApplyDevices(Retain(std::move(*result)));
+            std::unique_ptr<ProviderReadings> result(reinterpret_cast<ProviderReadings*>(lp));
+            ApplyDevices(g.roster.update(*result, GetTickCount64()));
             return 0;
         }
         case WM_TIMER:
@@ -420,13 +325,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return TRUE;
         case WM_DPICHANGED:
         case WM_DISPLAYCHANGE:
-            ApplyDevices(g.devices);  // redraw at the new icon size
+            ApplyDevices(g.devices, true);  // redraw at the new icon size
             return 0;
         case WM_DESTROY:
             KillTimer(hwnd, TIMER_POLL);
             KillTimer(hwnd, TIMER_DEBOUNCE);
-            for (auto& kv : g.trays) RemoveIcon(kv.second);
-            g.trays.clear();
+            for (auto& kv : g.buttons) DestroyButton(kv.second);
+            g.buttons.clear();
             PostQuitMessage(0);
             return 0;
         default:
@@ -442,6 +347,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
         CloseHandle(mutex);
         return 0;
     }
+    const bool comReady = SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED));
 
     WNDCLASSEXW wc = {};
     wc.cbSize = sizeof(wc);
@@ -449,16 +355,19 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     wc.hInstance = inst;
     wc.lpszClassName = kClassName;
     if (!RegisterClassExW(&wc)) return 1;
+    wc.lpfnWndProc = ButtonProc;
+    wc.lpszClassName = kButtonClass;
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    if (!RegisterClassExW(&wc)) return 1;
 
     // A hidden top-level window (not message-only) so it receives the
-    // broadcast WM_DEVICECHANGE and TaskbarCreated messages.
+    // broadcast WM_DEVICECHANGE messages. It also owns the menu.
     g.hwnd = CreateWindowExW(WS_EX_TOOLWINDOW, kClassName, L"BatteryBar", WS_POPUP, 0, 0, 0, 0, nullptr, nullptr, inst, nullptr);
     if (!g.hwnd) return 1;
-    g.taskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
 
     g.wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     g.worker = CreateThread(nullptr, 0, WorkerMain, nullptr, 0, nullptr);
-    ApplyDevices({});  // placeholder icon until the first poll finishes
+    ApplyDevices({});  // placeholder button until the first poll finishes
     SetTimer(g.hwnd, TIMER_POLL, POLL_MS, nullptr);
     RequestPoll();
 
@@ -476,5 +385,6 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     }
     if (g.wake) CloseHandle(g.wake);
     if (mutex) CloseHandle(mutex);
+    if (comReady) CoUninitialize();
     return 0;
 }

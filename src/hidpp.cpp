@@ -19,65 +19,98 @@ extern "C" {
 namespace {
 
 constexpr USHORT kLogitechVid = 0x046D;
-constexpr int kIoTimeoutMs = 500;
+constexpr int kIoTimeoutMs = 1000;
 
 // One open HID collection (overlapped I/O). Report buffers always have the
 // exact length the collection declares, as the HID stack requires.
-struct Channel {
+struct Pipe {
     HANDLE file = INVALID_HANDLE_VALUE;
-    HANDLE event = nullptr;
+    HANDLE readEvent = nullptr, writeEvent = nullptr;
     USHORT inLen = 0, outLen = 0;
-    bool shortOk = false, longOk = false;
-    std::wstring key;  // path without the collection suffix
+    OVERLAPPED ov = {};          // the read in flight; must not move while pending
+    std::vector<uint8_t> buf;
+    bool pending = false;
 
-    Channel() = default;
-    Channel(const Channel&) = delete;
-    Channel& operator=(const Channel&) = delete;
-    ~Channel() {
+    Pipe() = default;
+    Pipe(const Pipe&) = delete;
+    Pipe& operator=(const Pipe&) = delete;
+    ~Pipe() {
+        if (pending) {  // wait for the cancel so the kernel is done with ov and buf
+            DWORD got = 0;
+            CancelIoEx(file, &ov);
+            GetOverlappedResult(file, &ov, &got, TRUE);
+        }
         if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
-        if (event) CloseHandle(event);
+        if (readEvent) CloseHandle(readEvent);
+        if (writeEvent) CloseHandle(writeEvent);
     }
 
-    // Waits for an overlapped operation. On timeout the I/O is cancelled and
-    // we still wait for completion, so the buffer and OVERLAPPED stay valid.
-    // Returns bytes transferred, 0 on timeout, -1 on error.
-    int finish(OVERLAPPED& ov, BOOL started, int timeoutMs) {
-        DWORD got = 0;
-        if (!started) {
-            if (GetLastError() != ERROR_IO_PENDING) return -1;
-            if (WaitForSingleObject(event, static_cast<DWORD>(timeoutMs)) != WAIT_OBJECT_0) {
-                CancelIoEx(file, &ov);
-                if (!GetOverlappedResult(file, &ov, &got, TRUE)) {
-                    return GetLastError() == ERROR_OPERATION_ABORTED ? 0 : -1;
-                }
-                return static_cast<int>(got);  // completed just before the cancel
-            }
-        }
-        if (!GetOverlappedResult(file, &ov, &got, FALSE)) return -1;
-        return static_cast<int>(got);
+    // Leaves one read in flight. It stays pending across calls, so a reply
+    // that arrives late is still picked up by the next read.
+    void startRead() {
+        if (pending) return;
+        buf.assign(inLen, 0);
+        ov = OVERLAPPED{};
+        ov.hEvent = readEvent;
+        ResetEvent(readEvent);
+        if (ReadFile(file, buf.data(), inLen, nullptr, &ov) || GetLastError() == ERROR_IO_PENDING) pending = true;
     }
 
     bool write(const uint8_t* data, size_t n) {
-        std::vector<uint8_t> buf(outLen, 0);
-        std::copy(data, data + std::min<size_t>(n, buf.size()), buf.begin());
-        OVERLAPPED ov = {};
-        ov.hEvent = event;
-        ResetEvent(event);
-        BOOL started = WriteFile(file, buf.data(), outLen, nullptr, &ov);
-        return finish(ov, started, kIoTimeoutMs) > 0;
+        std::vector<uint8_t> out(outLen, 0);
+        std::copy(data, data + std::min<size_t>(n, out.size()), out.begin());
+        OVERLAPPED wov = {};
+        wov.hEvent = writeEvent;
+        ResetEvent(writeEvent);
+        DWORD wrote = 0;
+        if (!WriteFile(file, out.data(), outLen, nullptr, &wov)) {
+            if (GetLastError() != ERROR_IO_PENDING) return false;
+            if (WaitForSingleObject(writeEvent, kIoTimeoutMs) != WAIT_OBJECT_0) CancelIoEx(file, &wov);
+            if (!GetOverlappedResult(file, &wov, &wrote, TRUE)) return false;
+            return wrote > 0;
+        }
+        return GetOverlappedResult(file, &wov, &wrote, FALSE) && wrote > 0;
+    }
+};
+
+// The HID++ collections of one interface. Windows splits short (7-byte) and
+// long (20-byte) reports into separate collections, and a reply can arrive on
+// either whatever the request used: devices answer in long reports, while a
+// receiver reports an empty slot in a short one. So both are read together.
+struct Channel {
+    std::unique_ptr<Pipe> shortPipe, longPipe;
+    std::wstring key;  // path without the collection suffix
+
+    bool write(const uint8_t* data, size_t n) {
+        if (n == 0) return false;
+        Pipe* p = data[0] == hidpp::kReportShort ? shortPipe.get() : longPipe.get();
+        return p && p->write(data, n);
     }
 
+    // Returns bytes read from whichever collection answers first, 0 on timeout, -1 on error.
     int read(uint8_t* out, size_t cap, int timeoutMs) {
-        std::vector<uint8_t> buf(inLen, 0);
-        OVERLAPPED ov = {};
-        ov.hEvent = event;
-        ResetEvent(event);
-        BOOL started = ReadFile(file, buf.data(), inLen, nullptr, &ov);
-        int n = finish(ov, started, timeoutMs);
-        if (n <= 0) return n;
-        n = static_cast<int>(std::min<size_t>(static_cast<size_t>(n), cap));
-        std::copy(buf.begin(), buf.begin() + n, out);
-        return n;
+        Pipe* pipes[2] = {};
+        HANDLE events[2] = {};
+        DWORD count = 0;
+        for (Pipe* p : {shortPipe.get(), longPipe.get()}) {
+            if (!p) continue;
+            p->startRead();
+            if (!p->pending) continue;
+            pipes[count] = p;
+            events[count++] = p->readEvent;
+        }
+        if (count == 0) return -1;
+        DWORD w = WaitForMultipleObjects(count, events, FALSE, static_cast<DWORD>(timeoutMs));
+        if (w == WAIT_TIMEOUT) return 0;
+        if (w >= WAIT_OBJECT_0 + count) return -1;
+        Pipe& p = *pipes[w - WAIT_OBJECT_0];
+        DWORD got = 0;
+        BOOL ok = GetOverlappedResult(p.file, &p.ov, &got, FALSE);
+        p.pending = false;
+        if (!ok) return -1;
+        size_t n = std::min<size_t>(got, cap);
+        std::copy(p.buf.begin(), p.buf.begin() + n, out);
+        return static_cast<int>(n);
     }
 };
 
@@ -94,13 +127,14 @@ std::wstring FromUtf8(const std::string& s) {
     return w;
 }
 
-// Opens a Logitech HID path and keeps it if it exposes a HID++ report collection.
-std::unique_ptr<Channel> OpenChannel(const std::wstring& path) {
+// Opens a Logitech HID path and keeps it if it is a HID++ report collection.
+// isLong says which report size it carries; key identifies its interface.
+std::unique_ptr<Pipe> OpenPipe(const std::wstring& path, bool& isLong, std::wstring& key) {
     HANDLE h = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
                            OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
     if (h == INVALID_HANDLE_VALUE) return nullptr;
-    auto ch = std::make_unique<Channel>();
-    ch->file = h;  // closed by the destructor from here on
+    auto p = std::make_unique<Pipe>();
+    p->file = h;  // closed by the destructor from here on
 
     HIDD_ATTRIBUTES attr = {};
     attr.Size = sizeof(attr);
@@ -114,70 +148,50 @@ std::unique_ptr<Channel> OpenChannel(const std::wstring& path) {
     if (st != HIDP_STATUS_SUCCESS || caps.UsagePage < 0xFF00) return nullptr;  // 0xFF00 (receivers), 0xFF43 (BLE)
 
     const size_t inBytes = caps.InputReportByteLength, outBytes = caps.OutputReportByteLength;
-    ch->shortOk = inBytes == hidpp::kShortLen && outBytes == hidpp::kShortLen;
-    ch->longOk = inBytes == hidpp::kLongLen && outBytes == hidpp::kLongLen;
-    if (!ch->shortOk && !ch->longOk) return nullptr;
-    ch->inLen = caps.InputReportByteLength;
-    ch->outLen = caps.OutputReportByteLength;
-    ch->event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    if (!ch->event) return nullptr;
+    const bool shortOk = inBytes == hidpp::kShortLen && outBytes == hidpp::kShortLen;
+    isLong = inBytes == hidpp::kLongLen && outBytes == hidpp::kLongLen;
+    if (!shortOk && !isLong) return nullptr;
+    p->inLen = caps.InputReportByteLength;
+    p->outLen = caps.OutputReportByteLength;
+    p->readEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    p->writeEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!p->readEvent || !p->writeEvent) return nullptr;
 
     // Collections of one interface differ only by "&colNN"; strip it to group them.
     // The instance part also ends in a per-collection counter ("...&0&0001"), so drop that too:
     //   hid#vid_046d&pid_c52b&mi_02&col02#7&1ebf1dd&0&0001#{guid}  ->  hid#vid_046d&pid_c52b&mi_02#7&1ebf1dd&0
-    ch->key = Lower(path);
-    size_t pos = ch->key.find(L"&col");
+    key = Lower(path);
+    size_t pos = key.find(L"&col");
     if (pos != std::wstring::npos) {
-        size_t instStart = ch->key.find(L'#', pos);
-        size_t instEnd = instStart == std::wstring::npos ? instStart : ch->key.find(L'#', instStart + 1);
+        size_t instStart = key.find(L'#', pos);
+        size_t instEnd = instStart == std::wstring::npos ? instStart : key.find(L'#', instStart + 1);
         if (instEnd != std::wstring::npos) {
-            std::wstring inst = ch->key.substr(instStart, instEnd - instStart);
+            std::wstring inst = key.substr(instStart, instEnd - instStart);
             size_t amp = inst.rfind(L'&');
             if (amp != std::wstring::npos) inst.erase(amp);
-            ch->key = ch->key.substr(0, pos) + inst;
+            key = key.substr(0, pos) + inst;
         }
     }
-    return ch;
-}
-
-DeviceKind ToKind(hidpp::Kind k) {
-    switch (k) {
-        case hidpp::Kind::Keyboard: return DeviceKind::Keyboard;
-        case hidpp::Kind::Mouse: return DeviceKind::Mouse;
-        case hidpp::Kind::Headset: return DeviceKind::Headset;
-        case hidpp::Kind::Controller: return DeviceKind::Controller;
-        default: return DeviceKind::Other;
-    }
+    return p;
 }
 
 void ProbeChannel(Channel& ch, std::vector<BatteryInfo>& out) {
     hidpp::Transport t;
-    t.canShort = ch.shortOk;
-    t.canLong = ch.longOk;
+    t.canShort = ch.shortPipe != nullptr;
+    t.canLong = ch.longPipe != nullptr;
     t.write = [&ch](const uint8_t* d, size_t n) { return ch.write(d, n); };
     t.read = [&ch](uint8_t* b, size_t cap, int ms) { return ch.read(b, cap, ms); };
-    hidpp::Session session(t, kIoTimeoutMs);
 
-    auto add = [&](uint8_t idx, const hidpp::DeviceInfo& info) {
+    for (const hidpp::FoundDevice& d : hidpp::discover(t, kIoTimeoutMs)) {
         BatteryInfo b;
-        b.name = FromUtf8(info.name);
+        b.name = FromUtf8(d.name);
         if (b.name.empty()) b.name = L"Logitech device";
-        b.kind = ToKind(info.kind);
-        b.percent = info.battery.percent;
-        b.charging = info.battery.charging;
-        b.approximate = info.battery.approximate;
-        b.id = L"hidpp:" + ch.key + L":" + std::to_wstring(idx);
+        b.kind = d.kind;
+        b.percent = d.battery.percent;
+        b.charging = d.battery.charging;
+        b.approximate = d.battery.approximate;
+        b.id = L"hidpp:" + ch.key + L":" + std::to_wstring(d.index);
         out.push_back(b);
-    };
-
-    hidpp::DeviceInfo info;
-    if (session.probe(hidpp::kDirectIndex, info)) {  // direct Bluetooth or USB device
-        add(hidpp::kDirectIndex, info);
-        return;
-    }
-    for (uint8_t idx = 1; idx <= 6; ++idx) {  // receiver slots
-        hidpp::DeviceInfo d;
-        if (session.probe(idx, d)) add(idx, d);
     }
 }
 
@@ -190,8 +204,7 @@ std::vector<BatteryInfo> QueryHidpp() {
     HDEVINFO set = SetupDiGetClassDevsW(&hidGuid, nullptr, nullptr, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
     if (set == INVALID_HANDLE_VALUE) return out;
 
-    // Group collections per interface; prefer the long-report collection since
-    // many devices only answer long requests and reply in kind.
+    // Group the short and long collections of each interface into one channel.
     std::map<std::wstring, std::unique_ptr<Channel>> chosen;
     for (DWORD i = 0;; ++i) {
         SP_DEVICE_INTERFACE_DATA ifd = {};
@@ -208,23 +221,20 @@ std::vector<BatteryInfo> QueryHidpp() {
 
         std::wstring path = detail->DevicePath;
         if (Lower(path).find(L"vid_046d") == std::wstring::npos) continue;  // cheap filter before opening
-        std::unique_ptr<Channel> ch = OpenChannel(path);
-        if (!ch) continue;
-        auto it = chosen.find(ch->key);
-        if (it == chosen.end()) chosen[ch->key] = std::move(ch);
-        else if (!it->second->longOk && ch->longOk) it->second = std::move(ch);
+        bool isLong = false;
+        std::wstring key;
+        std::unique_ptr<Pipe> pipe = OpenPipe(path, isLong, key);
+        if (!pipe) continue;
+        std::unique_ptr<Channel>& ch = chosen[key];
+        if (!ch) {
+            ch = std::make_unique<Channel>();
+            ch->key = key;
+        }
+        std::unique_ptr<Pipe>& slot = isLong ? ch->longPipe : ch->shortPipe;
+        if (!slot) slot = std::move(pipe);
     }
     SetupDiDestroyDeviceInfoList(set);
 
     for (auto& kv : chosen) ProbeChannel(*kv.second, out);
-
-    // Drop duplicates (same device reachable through more than one interface).
-    std::vector<BatteryInfo> unique;
-    for (auto& b : out) {
-        bool dup = std::any_of(unique.begin(), unique.end(), [&](const BatteryInfo& u) {
-            return Lower(u.name) == Lower(b.name) && u.kind == b.kind;
-        });
-        if (!dup) unique.push_back(b);
-    }
-    return unique;
+    return out;
 }
