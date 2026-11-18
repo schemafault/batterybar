@@ -1,6 +1,6 @@
 # BatteryBar
 
-A small Windows utility that shows battery percentages for wireless mice, keyboards, headsets and game controllers as buttons on the taskbar, next to the icons of running apps. Each device gets its own button: a picture of the device (mouse, keyboard, headset or controller) above the percentage, which is coloured by level (green above 50, amber 21 to 50, red 20 or below). The picture turns yellow while the device is charging and grey when it is asleep. Hovering over a button gives the full detail, for example "MX Master 3S: 87% (charging)".
+A small Windows utility that shows battery percentages for wireless mice, keyboards, headsets and game controllers as buttons on the taskbar, next to the icons of running apps. Each device gets its own button: an outline picture of the device (mouse, keyboard, headset or controller) above the percentage, with no background, drawn in white on a dark taskbar and near-black on a light one. Colour is kept for the two states that matter: the number turns red at 20 or below and green while the device is charging. A device that is asleep is faded. The pictures come from the icon font that ships with Windows (Segoe Fluent Icons on Windows 11, Segoe MDL2 Assets on Windows 10). Hovering over a button gives the full detail, for example "MX Master 3S: 87% (charging)".
 
 It is a single static executable with no installer, frameworks or third-party libraries.
 

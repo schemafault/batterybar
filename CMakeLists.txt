@@ -39,6 +39,7 @@ if(WIN32)
     src/main.cpp
     src/roster.cpp
     src/appearance.cpp
+    src/icon.cpp
     src/hidpp_proto.cpp
     src/hidpp.cpp
     src/btbattery.cpp

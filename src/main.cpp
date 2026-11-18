@@ -1,8 +1,9 @@
 // BatteryBar: one taskbar button per wireless device, showing a picture of the
-// device and its battery percentage. Polling runs on a worker thread; the UI
+// device above its battery percentage. Polling runs on a worker thread; the UI
 // thread only draws icons and handles messages.
 #include "appearance.h"
 #include "device.h"
+#include "icon.h"
 #include "roster.h"
 
 #include <windows.h>
@@ -81,77 +82,14 @@ DWORD WINAPI WorkerMain(LPVOID) {
 
 void RequestPoll() { SetEvent(g.wake); }
 
-// ---- Icon drawing ----------------------------------------------------------
+// ---- Taskbar theme -------------------------------------------------------
 
-// Turns the appearance module's description into an icon. What the icon shows
-// is decided there; this only adds the number, which needs GDI text.
-HICON MakeIcon(const BatteryInfo& b, int s) {
-    const ButtonAppearance look = Describe(b);
-    const std::vector<uint32_t> backdrop = RenderBackdrop(b, s);
-    if (s <= 0 || backdrop.size() != static_cast<size_t>(s) * static_cast<size_t>(s)) return nullptr;
-
-    BITMAPINFO bi = {};
-    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bi.bmiHeader.biWidth = s;
-    bi.bmiHeader.biHeight = -s;  // top-down
-    bi.bmiHeader.biPlanes = 1;
-    bi.bmiHeader.biBitCount = 32;
-    bi.bmiHeader.biCompression = BI_RGB;
-
-    HDC dc = CreateCompatibleDC(nullptr);
-    void* bits = nullptr;
-    HBITMAP color = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
-    if (!dc || !color || !bits) {
-        if (color) DeleteObject(color);
-        if (dc) DeleteDC(dc);
-        return nullptr;
-    }
-    HGDIOBJ oldBmp = SelectObject(dc, color);
-    auto* px = static_cast<uint32_t*>(bits);
-    for (size_t i = 0; i < backdrop.size(); ++i) px[i] = backdrop[i] & 0x00FFFFFFu;
-
-    const TextBand band = TextBandFor(s);
-    SetBkMode(dc, TRANSPARENT);
-    SetTextColor(dc, RGB((look.textColour >> 16) & 0xFF, (look.textColour >> 8) & 0xFF, look.textColour & 0xFF));
-    HFONT font = nullptr;
-    HGDIOBJ oldFont = nullptr;
-    for (int h = band.bottom - band.top; h >= 6; --h) {  // shrink until the text fits
-        HFONT f = CreateFontW(-h, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
-                              CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
-        if (!f) break;
-        HGDIOBJ prev = SelectObject(dc, f);
-        SIZE sz = {};
-        GetTextExtentPoint32W(dc, look.text.c_str(), static_cast<int>(look.text.size()), &sz);
-        if (font) DeleteObject(font);
-        font = f;
-        if (!oldFont) oldFont = prev;
-        if (sz.cx <= s - std::max(2, s / 10)) break;
-    }
-    RECT rc = {0, band.top, s, band.bottom};
-    DrawTextW(dc, look.text.c_str(), -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-    GdiFlush();
-
-    // GDI text leaves the alpha byte undefined: take it from the backdrop.
-    for (size_t i = 0; i < backdrop.size(); ++i) {
-        uint32_t alpha = backdrop[i] & 0xFF000000u;
-        px[i] = alpha ? ((px[i] & 0x00FFFFFFu) | alpha) : 0u;
-    }
-
-    std::vector<BYTE> zeros(static_cast<size_t>((s + 15) / 16) * 2 * static_cast<size_t>(s), 0);
-    HBITMAP mask = CreateBitmap(s, s, 1, 1, zeros.data());
-    ICONINFO ii = {};
-    ii.fIcon = TRUE;
-    ii.hbmMask = mask;
-    ii.hbmColor = color;
-    HICON icon = CreateIconIndirect(&ii);
-
-    if (oldFont) SelectObject(dc, oldFont);
-    SelectObject(dc, oldBmp);
-    if (font) DeleteObject(font);
-    if (mask) DeleteObject(mask);
-    DeleteObject(color);
-    DeleteDC(dc);
-    return icon;
+// The icons have no background, so they are drawn light or dark to suit the taskbar.
+bool TaskbarIsLight() {
+    DWORD value = 0, size = sizeof(value);
+    return RegGetValueW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+                        L"SystemUsesLightTheme", RRF_RT_REG_DWORD, nullptr, &value, &size) == ERROR_SUCCESS &&
+           value != 0;
 }
 
 // ---- Taskbar buttons -------------------------------------------------------
@@ -191,6 +129,7 @@ void ApplyDevices(std::vector<BatteryInfo> list, bool redraw = false) {
         list.push_back(none);
     }
     g.devices = list;
+    const bool light = TaskbarIsLight();
 
     for (const BatteryInfo& b : g.devices) {
         Button& btn = g.buttons[b.id];
@@ -209,8 +148,8 @@ void ApplyDevices(std::vector<BatteryInfo> list, bool redraw = false) {
         SetWindowTextW(btn.hwnd, label.c_str());
 
         // The taskbar scales the large icon down, so draw it with pixels to spare.
-        HICON bigIcon = MakeIcon(b, 2 * GetSystemMetrics(SM_CXICON));
-        HICON smallIcon = MakeIcon(b, GetSystemMetrics(SM_CXSMICON));
+        HICON bigIcon = MakeIcon(b, 2 * GetSystemMetrics(SM_CXICON), light);
+        HICON smallIcon = MakeIcon(b, GetSystemMetrics(SM_CXSMICON), light);
         if (bigIcon) SendMessageW(btn.hwnd, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(bigIcon));
         if (smallIcon) SendMessageW(btn.hwnd, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(smallIcon));
         if (bigIcon && btn.bigIcon) DestroyIcon(btn.bigIcon);  // only after the window has the new one
@@ -327,6 +266,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_DISPLAYCHANGE:
             ApplyDevices(g.devices, true);  // redraw at the new icon size
             return 0;
+        case WM_SETTINGCHANGE:  // the taskbar switched between light and dark
+            if (lp && lstrcmpW(reinterpret_cast<const wchar_t*>(lp), L"ImmersiveColorSet") == 0) ApplyDevices(g.devices, true);
+            return DefWindowProcW(hwnd, msg, wp, lp);
         case WM_DESTROY:
             KillTimer(hwnd, TIMER_POLL);
             KillTimer(hwnd, TIMER_DEBOUNCE);

@@ -1,9 +1,10 @@
 // Plain assert-based tests for the button appearance rules (colours, text,
-// label and the rendered icon backdrop). No Windows APIs involved.
+// label, picture and layout). No Windows APIs involved.
 #include "../src/appearance.h"
 
 #include <cstdio>
 #include <cstdlib>
+#include <set>
 
 #define CHECK(cond)                                                              \
     do {                                                                         \
@@ -24,30 +25,59 @@ static BatteryInfo Make(int percent, DeviceKind kind = DeviceKind::Mouse) {
     return b;
 }
 
-static const uint32_t kGrey = 0xAAAAAA, kGreen = 0x50DC64, kAmber = 0xFFC107, kRed = 0xFF5252;
+// On a dark taskbar / on a light taskbar.
+static const uint32_t kWhite = 0xFFFFFF, kRed = 0xFF6B6B, kGreen = 0x6CCB5F;
+static const uint32_t kInk = 0x1A1A1A, kDarkRed = 0xC42B1C, kDarkGreen = 0x0F7B0F;
 
-static void test_colour_thresholds() {
-    CHECK(Describe(Make(100)).textColour == kGreen);
-    CHECK(Describe(Make(51)).textColour == kGreen);
-    CHECK(Describe(Make(50)).textColour == kAmber);
-    CHECK(Describe(Make(21)).textColour == kAmber);
+static void test_number_is_plain_until_low() {
+    CHECK(Describe(Make(100)).textColour == kWhite);
+    CHECK(Describe(Make(50)).textColour == kWhite);
+    CHECK(Describe(Make(21)).textColour == kWhite);
     CHECK(Describe(Make(20)).textColour == kRed);
     CHECK(Describe(Make(0)).textColour == kRed);
 }
 
+static void test_charging_is_green_even_when_low() {
+    BatteryInfo b = Make(80);
+    b.charging = true;
+    CHECK(Describe(b).textColour == kGreen);
+    b.percent = 5;
+    CHECK(Describe(b).textColour == kGreen);
+}
+
+static void test_light_taskbar_uses_dark_colours() {
+    CHECK(Describe(Make(80), true).textColour == kInk);
+    CHECK(Describe(Make(80), true).glyphColour == kInk);
+    CHECK(Describe(Make(10), true).textColour == kDarkRed);
+    BatteryInfo b = Make(80);
+    b.charging = true;
+    CHECK(Describe(b, true).textColour == kDarkGreen);
+}
+
+static void test_picture_never_takes_a_state_colour() {
+    BatteryInfo b = Make(10);
+    CHECK(Describe(b).glyphColour == kWhite);
+    b.charging = true;
+    CHECK(Describe(b).glyphColour == kWhite);
+}
+
 static void test_unknown() {
-    BatteryInfo b = Make(-1);
-    ButtonAppearance a = Describe(b);
+    ButtonAppearance a = Describe(Make(-1));
     CHECK(a.text == L"?");
-    CHECK(a.textColour == kGrey);
+    CHECK(a.textColour == kWhite);
     CHECK(a.label == L"MX Master 3S");
 }
 
-static void test_stale_text_is_grey() {
-    BatteryInfo b = Make(90);
+static void test_asleep_is_faded_and_plain() {
+    CHECK(Describe(Make(90)).opacity == 255);
+    BatteryInfo b = Make(10);
     b.stale = true;
-    CHECK(Describe(b).textColour == kGrey);
-    CHECK(Describe(b).text == L"90");
+    CHECK(Describe(b).opacity < 255);
+    CHECK(Describe(b).opacity > 0);
+    CHECK(Describe(b).textColour == kWhite);  // a last reading is not an alarm
+    CHECK(Describe(b).text == L"10");
+    b.charging = true;  // asleep wins over charging
+    CHECK(Describe(b).textColour == kWhite);
 }
 
 static void test_text() {
@@ -57,16 +87,13 @@ static void test_text() {
     CHECK(Describe(Make(130)).text == L"100");
 }
 
-static void test_glyph_colours() {
-    BatteryInfo b = Make(50);
-    CHECK(Describe(b).glyphColour == 0xF0F0F0);
-    CHECK(Describe(b).backColour == 0x202020);
-    b.charging = true;
-    CHECK(Describe(b).glyphColour == 0xFFD54F);
-    b.stale = true;  // asleep wins over charging
-    CHECK(Describe(b).glyphColour == 0x8A8A8A);
-    b.charging = false;
-    CHECK(Describe(b).glyphColour == 0x8A8A8A);
+static void test_every_kind_has_its_own_picture() {
+    std::set<wchar_t> seen;
+    for (DeviceKind k : kAllKinds) {
+        wchar_t g = Describe(Make(50, k)).glyph;
+        CHECK(g >= 0xE700 && g <= 0xF8FF);  // the icon fonts' private-use range
+        CHECK(seen.insert(g).second);
+    }
 }
 
 static void test_label_variants() {
@@ -84,93 +111,14 @@ static void test_label_variants() {
     CHECK(Describe(b).label == L"MX Master 3S: 87% (charging) (asleep, last reading)");
 }
 
-static void test_text_band() {
-    TextBand t = TextBandFor(32);
-    CHECK(t.top == 32 * 46 / 100);
-    CHECK(t.bottom == 32 * 98 / 100);
-    TextBand t64 = TextBandFor(64);
-    CHECK(t64.top == 29 && t64.bottom == 62);
-}
-
-static uint32_t At(const std::vector<uint32_t>& px, int size, int x, int y) {
-    return px[static_cast<size_t>(y) * static_cast<size_t>(size) + static_cast<size_t>(x)];
-}
-
-static void test_backdrop_shape() {
-    for (int size : {16, 32, 64}) {
-        std::vector<uint32_t> px = RenderBackdrop(Make(50), size);
-        CHECK(px.size() == static_cast<size_t>(size) * static_cast<size_t>(size));
-        // At 16px the corner pixel is still faintly covered by the curve, so
-        // only require it to be mostly transparent there.
-        const int corners[4][2] = {{0, 0}, {size - 1, 0}, {0, size - 1}, {size - 1, size - 1}};
-        for (const auto& c : corners) {
-            uint32_t p = At(px, size, c[0], c[1]);
-            if (size >= 32) CHECK(p == 0);
-            else CHECK((p >> 24) < 0x40);
-        }
-        CHECK(At(px, size, size / 2, size / 2) == 0xFF202020u);
-    }
-}
-
-static void test_backdrop_text_band_is_plain() {
-    for (DeviceKind k : kAllKinds)
-        for (int size : {16, 32, 64}) {
-            std::vector<uint32_t> px = RenderBackdrop(Make(50, k), size);
-            TextBand t = TextBandFor(size);
-            for (int y = t.top; y < t.bottom; ++y)
-                for (int x = 0; x < size; ++x) {
-                    uint32_t p = At(px, size, x, y);
-                    // Either outside the rounded square or exactly the back colour.
-                    CHECK(p == 0 || (p & 0x00FFFFFFu) == 0x202020u);
-                }
-        }
-}
-
-static int GlyphPixels(const std::vector<uint32_t>& px, int size, uint32_t glyph) {
-    int n = 0;
-    for (int y = 0; y < size / 2; ++y)
-        for (int x = 0; x < size; ++x)
-            if ((At(px, size, x, y) & 0x00FFFFFFu) == glyph) ++n;
-    return n;
-}
-
-static int GlyphColumns(const std::vector<uint32_t>& px, int size, uint32_t glyph) {
-    int cols = 0;
-    for (int x = 0; x < size; ++x)
-        for (int y = 0; y < size; ++y)
-            if ((At(px, size, x, y) & 0x00FFFFFFu) == glyph) {
-                ++cols;
-                break;
-            }
-    return cols;
-}
-
-static void test_every_kind_draws_a_glyph() {
-    for (DeviceKind k : kAllKinds)
-        for (int size : {16, 32, 64})
-            CHECK(GlyphPixels(RenderBackdrop(Make(50, k), size), size, 0xF0F0F0) > 0);
-}
-
-static void test_glyph_follows_colour() {
-    BatteryInfo b = Make(50, DeviceKind::Keyboard);
-    b.charging = true;
-    CHECK(GlyphPixels(RenderBackdrop(b, 64), 64, 0xFFD54F) > 0);
-    CHECK(GlyphPixels(RenderBackdrop(b, 64), 64, 0xF0F0F0) == 0);
-    b.stale = true;
-    CHECK(GlyphPixels(RenderBackdrop(b, 64), 64, 0x8A8A8A) > 0);
-}
-
-static void test_kinds_differ() {
-    CHECK(RenderBackdrop(Make(50, DeviceKind::Mouse), 32) != RenderBackdrop(Make(50, DeviceKind::Keyboard), 32));
-    CHECK(RenderBackdrop(Make(50, DeviceKind::Headset), 32) != RenderBackdrop(Make(50, DeviceKind::Controller), 32));
-}
-
-static void test_keyboard_wider_than_mouse() {
-    for (int size : {32, 64}) {
-        int mouse = GlyphColumns(RenderBackdrop(Make(50, DeviceKind::Mouse), size), size, 0xF0F0F0);
-        int kb = GlyphColumns(RenderBackdrop(Make(50, DeviceKind::Keyboard), size), size, 0xF0F0F0);
-        CHECK(mouse > 0);
-        CHECK(kb > mouse);
+static void test_layout_keeps_picture_and_number_apart() {
+    for (int size : {16, 24, 32, 48, 64}) {
+        IconLayout at = LayoutFor(size);
+        CHECK(at.glyphEm > 0 && at.textEm > 0);
+        CHECK(at.glyphEm <= at.glyphBottom);     // the picture fits its band
+        CHECK(at.textBaseline <= size);
+        // Digits rise about three quarters of the font size above the baseline.
+        CHECK(at.textBaseline - at.textEm * 3 / 4 >= at.glyphBottom);
     }
 }
 
@@ -183,19 +131,16 @@ static void test_kind_letter() {
 }
 
 int main() {
-    test_colour_thresholds();
+    test_number_is_plain_until_low();
+    test_charging_is_green_even_when_low();
+    test_light_taskbar_uses_dark_colours();
+    test_picture_never_takes_a_state_colour();
     test_unknown();
-    test_stale_text_is_grey();
+    test_asleep_is_faded_and_plain();
     test_text();
-    test_glyph_colours();
+    test_every_kind_has_its_own_picture();
     test_label_variants();
-    test_text_band();
-    test_backdrop_shape();
-    test_backdrop_text_band_is_plain();
-    test_every_kind_draws_a_glyph();
-    test_glyph_follows_colour();
-    test_kinds_differ();
-    test_keyboard_wider_than_mouse();
+    test_layout_keeps_picture_and_number_apart();
     test_kind_letter();
     std::puts("all appearance tests passed");
     return 0;
