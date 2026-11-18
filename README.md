@@ -4,6 +4,12 @@ A small Windows utility that shows battery percentages for wireless mice, keyboa
 
 It is a single static executable with no installer, frameworks or third-party libraries.
 
+## Download
+
+**[Download BatteryBar.exe](https://github.com/schemafault/batterybar/releases/latest/download/BatteryBar.exe)** (latest release, 64-bit Windows 10 or 11)
+
+Save it anywhere and run it; there is nothing to install. Windows may show a SmartScreen warning the first time because the file is not signed: choose "More info", then "Run anyway". Earlier versions are on the [releases page](https://github.com/schemafault/batterybar/releases).
+
 ## Sources
 
 Devices are read from three places. Where the same device appears in more than one, the first in this list wins.
