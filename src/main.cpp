@@ -8,6 +8,7 @@
 
 #include <windows.h>
 #include <dbt.h>
+#include <dwmapi.h>
 #include <objbase.h>
 #include <propsys.h>
 #include <shellapi.h>
@@ -27,12 +28,14 @@ constexpr UINT_PTR TIMER_POLL = 1;
 constexpr UINT_PTR TIMER_DEBOUNCE = 2;
 constexpr UINT POLL_MS = 60000;
 constexpr UINT DEBOUNCE_MS = 2000;
-enum MenuId { ID_REFRESH = 100, ID_AUTOSTART, ID_EXIT };
+enum MenuId { ID_REFRESH = 100, ID_AUTOSTART, ID_EXIT, ID_STYLE_FIRST = 200 };  // one id per IconStyle from ID_STYLE_FIRST
 
 const wchar_t kClassName[] = L"BatteryBarWindow";
 const wchar_t kButtonClass[] = L"BatteryBarButton";
 const wchar_t kRunKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 const wchar_t kRunValue[] = L"BatteryBar";
+const wchar_t kSettingsKey[] = L"Software\\BatteryBar";
+const wchar_t kStyleValue[] = L"IconStyle";
 const wchar_t kNoDevicesId[] = L"none";
 
 // PKEY_AppUserModel_ID, spelled out so no extra import library is needed.
@@ -49,6 +52,7 @@ struct App {
     Roster roster;                           // UI thread only
     std::vector<BatteryInfo> devices;
     std::map<std::wstring, Button> buttons;  // keyed by BatteryInfo::id
+    IconStyle style = IconStyle::PictureAndNumber;
     HANDLE wake = nullptr;    // auto-reset event: "poll now"
     HANDLE worker = nullptr;
     volatile LONG quit = 0;
@@ -141,15 +145,22 @@ void ApplyDevices(std::vector<BatteryInfo> list, bool redraw = false) {
                                        CW_USEDEFAULT, 300, 120, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
             if (!btn.hwnd) continue;
             SetAppId(btn.hwnd, b.id);
+            // The window never opens, so supply the hover preview ourselves
+            // (see WM_DWMSENDICONICTHUMBNAIL) and keep "peek" from showing an empty frame.
+            const BOOL on = TRUE;
+            DwmSetWindowAttribute(btn.hwnd, DWMWA_FORCE_ICONIC_REPRESENTATION, &on, sizeof(on));
+            DwmSetWindowAttribute(btn.hwnd, DWMWA_HAS_ICONIC_BITMAP, &on, sizeof(on));
+            DwmSetWindowAttribute(btn.hwnd, DWMWA_DISALLOW_PEEK, &on, sizeof(on));
         } else if (state == btn.state && !redraw) {
             continue;  // nothing changed: leave the button alone
         }
         btn.state = state;
+        DwmInvalidateIconicBitmaps(btn.hwnd);  // the hover preview is out of date too
         SetWindowTextW(btn.hwnd, label.c_str());
 
         // The taskbar scales the large icon down, so draw it with pixels to spare.
-        HICON bigIcon = MakeIcon(b, 2 * GetSystemMetrics(SM_CXICON), light);
-        HICON smallIcon = MakeIcon(b, GetSystemMetrics(SM_CXSMICON), light);
+        HICON bigIcon = MakeIcon(b, 2 * GetSystemMetrics(SM_CXICON), light, g.style);
+        HICON smallIcon = MakeIcon(b, GetSystemMetrics(SM_CXSMICON), light, g.style);
         if (bigIcon) SendMessageW(btn.hwnd, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(bigIcon));
         if (smallIcon) SendMessageW(btn.hwnd, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(smallIcon));
         if (bigIcon && btn.bigIcon) DestroyIcon(btn.bigIcon);  // only after the window has the new one
@@ -169,7 +180,24 @@ void ApplyDevices(std::vector<BatteryInfo> list, bool redraw = false) {
     }
 }
 
-// ---- Autostart and menu ----------------------------------------------------
+// ---- Settings, autostart and menu -------------------------------------------
+
+IconStyle LoadStyle() {
+    DWORD value = 0, size = sizeof(value);
+    if (RegGetValueW(HKEY_CURRENT_USER, kSettingsKey, kStyleValue, RRF_RT_REG_DWORD, nullptr, &value, &size) != ERROR_SUCCESS ||
+        value >= static_cast<DWORD>(kIconStyleCount))
+        return IconStyle::PictureAndNumber;
+    return static_cast<IconStyle>(value);
+}
+
+void SaveStyle(IconStyle style) {
+    HKEY key;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, kSettingsKey, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &key, nullptr) != ERROR_SUCCESS)
+        return;
+    const DWORD value = static_cast<DWORD>(style);
+    RegSetValueExW(key, kStyleValue, 0, REG_DWORD, reinterpret_cast<const BYTE*>(&value), sizeof(value));
+    RegCloseKey(key);
+}
 
 bool AutostartEnabled() {
     HKEY key;
@@ -205,6 +233,13 @@ void ShowMenu(int x, int y) {
     }
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, ID_REFRESH, L"Refresh now");
+    if (HMENU styles = CreatePopupMenu()) {  // destroyed along with the menu it is attached to
+        for (int i = 0; i < kIconStyleCount; ++i)
+            AppendMenuW(styles, MF_STRING, static_cast<UINT_PTR>(ID_STYLE_FIRST + i), StyleName(static_cast<IconStyle>(i)));
+        CheckMenuRadioItem(styles, ID_STYLE_FIRST, ID_STYLE_FIRST + kIconStyleCount - 1,
+                           static_cast<UINT>(ID_STYLE_FIRST + static_cast<int>(g.style)), MF_BYCOMMAND);
+        AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(styles), L"Icon style");
+    }
     AppendMenuW(menu, MF_STRING | (AutostartEnabled() ? MF_CHECKED : 0), ID_AUTOSTART, L"Start with Windows");
     AppendMenuW(menu, MF_STRING, ID_EXIT, L"Exit");
 
@@ -216,6 +251,11 @@ void ShowMenu(int x, int y) {
     if (cmd == ID_REFRESH) RequestPoll();
     else if (cmd == ID_AUTOSTART) SetAutostart(!AutostartEnabled());
     else if (cmd == ID_EXIT) DestroyWindow(g.hwnd);
+    else if (cmd >= ID_STYLE_FIRST && cmd < static_cast<UINT>(ID_STYLE_FIRST + kIconStyleCount)) {
+        g.style = static_cast<IconStyle>(cmd - ID_STYLE_FIRST);
+        SaveStyle(g.style);
+        ApplyDevices(g.devices, true);
+    }
 }
 
 // ---- Windows ---------------------------------------------------------------
@@ -224,6 +264,18 @@ void ShowMenu(int x, int y) {
 // to restore it, which shows the menu instead.
 LRESULT CALLBACK ButtonProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
+        case WM_DWMSENDICONICTHUMBNAIL: {  // the pointer is resting on the button
+            for (const BatteryInfo& b : g.devices) {
+                auto it = g.buttons.find(b.id);
+                if (it == g.buttons.end() || it->second.hwnd != hwnd) continue;
+                if (HBITMAP preview = MakeHoverPreview(b, HIWORD(lp), LOWORD(lp), TaskbarIsLight())) {
+                    DwmSetIconicThumbnail(hwnd, preview, 0);
+                    DeleteObject(preview);
+                }
+                break;
+            }
+            return 0;
+        }
         case WM_QUERYOPEN:
             PostMessageW(g.hwnd, WM_SHOWMENU, 0, 0);
             return FALSE;  // stay minimised
@@ -307,6 +359,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     g.hwnd = CreateWindowExW(WS_EX_TOOLWINDOW, kClassName, L"BatteryBar", WS_POPUP, 0, 0, 0, 0, nullptr, nullptr, inst, nullptr);
     if (!g.hwnd) return 1;
 
+    g.style = LoadStyle();
     g.wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     g.worker = CreateThread(nullptr, 0, WorkerMain, nullptr, 0, nullptr);
     ApplyDevices({});  // placeholder button until the first poll finishes

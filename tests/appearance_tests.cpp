@@ -98,17 +98,17 @@ static void test_every_kind_has_its_own_picture() {
 
 static void test_label_variants() {
     BatteryInfo b = Make(87);
-    CHECK(Describe(b).label == L"MX Master 3S: 87%");
+    CHECK(Describe(b).label == L"87% - MX Master 3S");
     b.approximate = true;
-    CHECK(Describe(b).label == L"MX Master 3S: ~87%");
+    CHECK(Describe(b).label == L"~87% - MX Master 3S");
     b.approximate = false;
     b.charging = true;
-    CHECK(Describe(b).label == L"MX Master 3S: 87% (charging)");
+    CHECK(Describe(b).label == L"87% (charging) - MX Master 3S");
     b.charging = false;
     b.stale = true;
-    CHECK(Describe(b).label == L"MX Master 3S: 87% (asleep, last reading)");
+    CHECK(Describe(b).label == L"87% (asleep, last reading) - MX Master 3S");
     b.charging = true;
-    CHECK(Describe(b).label == L"MX Master 3S: 87% (charging) (asleep, last reading)");
+    CHECK(Describe(b).label == L"87% (charging) (asleep, last reading) - MX Master 3S");
 }
 
 static void test_layout_keeps_picture_and_number_apart() {
@@ -120,6 +120,76 @@ static void test_layout_keeps_picture_and_number_apart() {
         // Digits rise about three quarters of the font size above the baseline.
         CHECK(at.textBaseline - at.textEm * 3 / 4 >= at.glyphBottom);
     }
+}
+
+static void test_ring_styles_show_two_things_each() {
+    for (int size : {16, 24, 32, 64}) {
+        IconLayout picture = LayoutFor(size, IconStyle::PictureInRing);
+        CHECK(picture.ring && picture.glyphEm > 0 && picture.textEm == 0);
+        CHECK(picture.glyphBottom == size);  // centred in the whole icon
+        IconLayout number = LayoutFor(size, IconStyle::NumberInRing);
+        CHECK(number.ring && number.glyphEm == 0 && number.textEm > 0);
+        CHECK(number.textBaseline < 0);  // centred, not on a baseline
+        // Only three digits shrink, so 5 and 87 are the same size.
+        CHECK(LayoutFor(size, IconStyle::NumberInRing, 1).textEm == number.textEm);
+        CHECK(LayoutFor(size, IconStyle::NumberInRing, 3).textEm < number.textEm);
+        CHECK(!LayoutFor(size, IconStyle::PictureAndNumber).ring);
+        CHECK(LayoutFor(size, IconStyle::PictureAndNumber, 3).textEm == LayoutFor(size).textEm);
+    }
+}
+
+static void test_style_names_differ() {
+    std::set<std::wstring> names;
+    for (int i = 0; i < kIconStyleCount; ++i) CHECK(names.insert(StyleName(static_cast<IconStyle>(i))).second);
+}
+
+static int Sum(const std::vector<uint8_t>& v) {
+    int n = 0;
+    for (uint8_t c : v) n += c;
+    return n;
+}
+
+static void test_ring_fills_clockwise_from_the_top() {
+    for (int size : {24, 64}) {
+        const size_t count = static_cast<size_t>(size) * static_cast<size_t>(size);
+        auto at = [size](int x, int y) { return static_cast<size_t>(y) * static_cast<size_t>(size) + static_cast<size_t>(x); };
+        const int mid = size / 2, edge = size * 6 / 100;  // a pixel inside the band on each side
+
+        RingMask full = RenderRing(size, 100), empty = RenderRing(size, 0), half = RenderRing(size, 50);
+        CHECK(full.track.size() == count && full.level.size() == count);
+        CHECK(full.level == full.track);
+        CHECK(Sum(empty.level) == 0);
+        CHECK(empty.track == full.track);  // the faint circle never changes
+
+        // The middle and the corners are left for the picture or number.
+        CHECK(full.track[at(mid, mid)] == 0);
+        CHECK(full.track[at(0, 0)] == 0 && full.track[at(size - 1, size - 1)] == 0);
+        CHECK(full.track[at(mid, edge)] == 255);
+
+        // At 50% the right side is filled and the left is not.
+        CHECK(half.level[at(size - 1 - edge, mid - 2)] == 255);
+        CHECK(half.level[at(edge, mid - 2)] == 0);
+        // A quarter fills the top right only.
+        RingMask quarter = RenderRing(size, 25);
+        CHECK(quarter.level[at(size - 1 - edge, mid + size / 8)] == 0);
+
+        int last = 0;  // more battery never means less ring
+        for (int p = 0; p <= 100; p += 5) {
+            RingMask m = RenderRing(size, p);
+            for (size_t i = 0; i < count; ++i) CHECK(m.level[i] <= m.track[i]);
+            CHECK(Sum(m.level) >= last);
+            last = Sum(m.level);
+        }
+        CHECK(RenderRing(size, 130).level == full.level);
+        CHECK(RenderRing(size, -1).level == empty.level);
+    }
+    CHECK(RenderRing(0, 50).track.empty());
+}
+
+static void test_level_follows_percent() {
+    CHECK(Describe(Make(87)).level == 87);
+    CHECK(Describe(Make(130)).level == 100);
+    CHECK(Describe(Make(-1)).level == 0);
 }
 
 static void test_kind_letter() {
@@ -141,6 +211,10 @@ int main() {
     test_every_kind_has_its_own_picture();
     test_label_variants();
     test_layout_keeps_picture_and_number_apart();
+    test_ring_styles_show_two_things_each();
+    test_style_names_differ();
+    test_ring_fills_clockwise_from_the_top();
+    test_level_follows_percent();
     test_kind_letter();
     std::puts("all appearance tests passed");
     return 0;

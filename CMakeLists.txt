@@ -46,7 +46,7 @@ if(WIN32)
     src/xinput_battery.cpp
     res/app.rc)
   target_compile_definitions(BatteryBar PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
-  target_link_libraries(BatteryBar PRIVATE setupapi hid cfgmgr32 shell32 user32 gdi32 advapi32 ole32 uuid)
+  target_link_libraries(BatteryBar PRIVATE setupapi hid cfgmgr32 shell32 user32 gdi32 advapi32 ole32 uuid dwmapi)
 
   if(MSVC)
     # CMake merges the manifest itself; keep it out of the .rc to avoid a duplicate resource.

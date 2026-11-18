@@ -1,6 +1,6 @@
 # BatteryBar
 
-A small Windows utility that shows battery percentages for wireless mice, keyboards, headsets and game controllers as buttons on the taskbar, next to the icons of running apps. Each device gets its own button: an outline picture of the device (mouse, keyboard, headset or controller) above the percentage, with no background, drawn in white on a dark taskbar and near-black on a light one. Colour is kept for the two states that matter: the number turns red at 20 or below and green while the device is charging. A device that is asleep is faded. The pictures come from the icon font that ships with Windows (Segoe Fluent Icons on Windows 11, Segoe MDL2 Assets on Windows 10). Hovering over a button gives the full detail, for example "MX Master 3S: 87% (charging)".
+A small Windows utility that shows battery percentages for wireless mice, keyboards, headsets and game controllers as buttons on the taskbar, next to the icons of running apps. Each device gets its own button. In the default style it is an outline picture of the device (mouse, keyboard, headset or controller) above the percentage, with no background, drawn in white on a dark taskbar and near-black on a light one. Colour is kept for the two states that matter: the number turns red at 20 or below and green while the device is charging. A device that is asleep is faded. The pictures come from the icon font that ships with Windows (Segoe Fluent Icons on Windows 11, Segoe MDL2 Assets on Windows 10). Hovering over a button shows a preview with the reading in large type, a level bar and the state (charging, asleep or approximate), whichever icon style is in use. The title above it gives the same detail in words, for example "87% (charging) - MX Master 3S".
 
 It is a single static executable with no installer, frameworks or third-party libraries.
 
@@ -46,6 +46,7 @@ Click any button for a menu with:
 
 - the list of devices and their levels
 - Refresh now
+- Icon style, which switches every button between three designs: the picture above the number (the default), the picture inside a ring that fills with the battery level, or the number inside that ring. Each shows two of picture, number and level, because all three do not fit legibly in a taskbar icon. The choice is kept under HKCU\Software\BatteryBar
 - Start with Windows, which adds or removes a value under HKCU\Software\Microsoft\Windows\CurrentVersion\Run for the current user
 - Exit
 
