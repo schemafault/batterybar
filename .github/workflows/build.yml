@@ -5,13 +5,18 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Nothing gets write access unless a job asks for it below.
+permissions:
+  contents: read
+
 jobs:
   windows:
     runs-on: windows-latest
-    permissions:
-      contents: write
     steps:
-      - uses: actions/checkout@v4
+      # Actions are pinned to a commit so a moved tag cannot change what runs.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Configure
         run: cmake -S . -B build -A x64
       - name: Build
@@ -19,13 +24,36 @@ jobs:
       - name: Test
         run: ctest --test-dir build -C Release --output-on-failure
       - name: Upload executable
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: BatteryBar
           path: build/Release/BatteryBar.exe
-      # Pushing a tag such as v1.0.0 publishes the exe as a GitHub release.
+          if-no-files-found: error
+
+  # Pushing a tag such as v1.0.0 publishes the exe as a GitHub release, with a
+  # signed record that it was built by this workflow from this repository.
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: windows
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write      # create the release
+      id-token: write      # sign the build provenance
+      attestations: write  # store the build provenance
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: BatteryBar
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: BatteryBar.exe
       - name: Publish release
-        if: startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${{ github.ref_name }}" build/Release/BatteryBar.exe --title "BatteryBar ${{ github.ref_name }}" --generate-notes
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          sha=$(sha256sum BatteryBar.exe | cut -d' ' -f1)
+          gh release create "$TAG" BatteryBar.exe --verify-tag \
+            --title "BatteryBar $TAG" --generate-notes \
+            --notes "SHA-256 of BatteryBar.exe: \`$sha\`"

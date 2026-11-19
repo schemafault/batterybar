@@ -5,8 +5,8 @@
 #endif
 
 VS_VERSION_INFO VERSIONINFO
-FILEVERSION 1,0,0,0
-PRODUCTVERSION 1,0,0,0
+FILEVERSION 1,0,1,0
+PRODUCTVERSION 1,0,1,0
 FILEOS VOS_NT_WINDOWS32
 FILETYPE VFT_APP
 BEGIN
@@ -16,7 +16,7 @@ BEGIN
     BEGIN
       VALUE "FileDescription", "BatteryBar"
       VALUE "ProductName", "BatteryBar"
-      VALUE "FileVersion", "1.0.0.0"
+      VALUE "FileVersion", "1.0.1.0"
       VALUE "LegalCopyright", "Copyright (c) 2026 schemafault"
       VALUE "OriginalFilename", "BatteryBar.exe"
     END

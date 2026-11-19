@@ -8,7 +8,29 @@ It is a single static executable with no installer, frameworks or third-party li
 
 **[Download BatteryBar.exe](https://github.com/schemafault/batterybar/releases/latest/download/BatteryBar.exe)** (latest release, 64-bit Windows 10 or 11)
 
-Save it anywhere and run it; there is nothing to install. Windows may show a SmartScreen warning the first time because the file is not signed: choose "More info", then "Run anyway". Earlier versions are on the [releases page](https://github.com/schemafault/batterybar/releases).
+Save it anywhere and run it; there is nothing to install. Earlier versions are on the [releases page](https://github.com/schemafault/batterybar/releases).
+
+### If Windows blocks it
+
+The file is not code-signed, so Windows treats a downloaded copy as unknown. What to do depends on which message appears:
+
+- **The browser will not keep the download.** In Edge, open the downloads list, choose "..." next to the file, then "Keep", then "Keep anyway".
+- **A blue "Windows protected your PC" box.** Choose "More info", then "Run anyway".
+- **No "Run anyway" button.** Right-click BatteryBar.exe, choose Properties, tick "Unblock" at the bottom of the General tab and choose OK. The same thing from PowerShell:
+
+      Unblock-File .\BatteryBar.exe
+
+- **"Smart App Control blocked this app".** Smart App Control refuses every unsigned program and has no per-app exception, so unblocking does not help. BatteryBar will only run with Smart App Control turned off (Windows Security, App & browser control, Smart App Control settings), which affects all apps, not just this one.
+
+### Checking the download
+
+Before unblocking a file, you can confirm it is the one this repository built. Each release from v1.0.1 onwards lists the SHA-256 of the exe in its notes; compare it with:
+
+    Get-FileHash .\BatteryBar.exe
+
+Those releases also carry a build provenance record signed through Sigstore, which shows that the exe was produced by this repository's GitHub Actions workflow and not uploaded by hand. With the [GitHub CLI](https://cli.github.com) installed:
+
+    gh attestation verify .\BatteryBar.exe --repo schemafault/batterybar
 
 ## Sources
 
@@ -62,7 +84,7 @@ The buttons are minimised windows that never open, so they also appear in Alt+Ta
 
 ## Releases
 
-Every push is built on GitHub Actions and the executable is attached to the run as the BatteryBar artefact. Pushing a tag that starts with "v" (for example v1.0.0) also publishes the executable as a GitHub release.
+Every push is built on GitHub Actions and the executable is attached to the run as the BatteryBar artefact. Pushing a tag that starts with "v" (for example v1.0.0) also publishes the executable as a GitHub release, with its SHA-256 in the notes and a signed build provenance record.
 
 ## Limits
 
